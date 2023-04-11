@@ -140,6 +140,219 @@ struct TensorFormat {
   int components_per_element_;
 };
 
+template <typename T>
+inline T roundUp(T m, T n)
+{
+    return ((m + n - 1) / n) * n;
+}
+
+inline void cudaCheck(cudaError_t ret)
+{
+    if (ret != cudaSuccess)
+    {
+      LOG_MESSAGE(TRITONSERVER_LOG_ERROR,
+          (std::string("Cuda failure: ") + cudaGetErrorString(ret)).c_str());
+        abort();
+    }
+}
+
+//!
+//! \class TrtCudaBuffer
+//! \brief Managed buffer for host and device
+//!
+template <typename A, typename D>
+class TrtCudaBuffer
+{
+public:
+    TrtCudaBuffer() = default;
+
+    TrtCudaBuffer(const TrtCudaBuffer&) = delete;
+
+    TrtCudaBuffer& operator=(const TrtCudaBuffer&) = delete;
+
+    TrtCudaBuffer(TrtCudaBuffer&& rhs)
+    {
+        reset(rhs.mPtr);
+        rhs.mPtr = nullptr;
+    }
+
+    TrtCudaBuffer& operator=(TrtCudaBuffer&& rhs)
+    {
+        if (this != &rhs)
+        {
+            reset(rhs.mPtr);
+            rhs.mPtr = nullptr;
+        }
+        return *this;
+    }
+
+    ~TrtCudaBuffer()
+    {
+        reset();
+    }
+
+    TrtCudaBuffer(size_t size)
+    {
+        A()(&mPtr, size);
+    }
+
+    void allocate(size_t size)
+    {
+        reset();
+        A()(&mPtr, size);
+    }
+
+    void reset(void* ptr = nullptr)
+    {
+        if (mPtr)
+        {
+            D()(mPtr);
+        }
+        mPtr = ptr;
+    }
+
+    void* get() const
+    {
+        return mPtr;
+    }
+
+private:
+    void* mPtr{nullptr};
+};
+
+struct DeviceAllocator
+{
+    void operator()(void** ptr, size_t size)
+    {
+        cudaCheck(cudaMalloc(ptr, size));
+    }
+};
+
+struct DeviceDeallocator
+{
+    void operator()(void* ptr)
+    {
+        cudaCheck(cudaFree(ptr));
+    }
+};
+
+struct HostAllocator
+{
+    void operator()(void** ptr, size_t size)
+    {
+        cudaCheck(cudaMallocHost(ptr, size));
+    }
+};
+
+struct HostDeallocator
+{
+    void operator()(void* ptr)
+    {
+        cudaCheck(cudaFreeHost(ptr));
+    }
+};
+
+using TrtDeviceBuffer = TrtCudaBuffer<DeviceAllocator, DeviceDeallocator>;
+using TrtHostBuffer = TrtCudaBuffer<HostAllocator, HostDeallocator>;
+
+//!
+//! \class MirroredBuffer
+//! \brief Coupled host and device buffers
+//!
+class IMirroredBuffer
+{
+public:
+    virtual void allocate(size_t size) = 0;
+    virtual void* getDeviceBuffer() const = 0;
+    virtual void* getHostBuffer() const = 0;
+    virtual void hostToDevice(cudaStream_t& stream) = 0;
+    virtual void deviceToHost(cudaStream_t& stream) = 0;
+    virtual size_t getSize() const = 0;
+    virtual ~IMirroredBuffer() = default;
+
+}; // class IMirroredBuffer
+
+class DiscreteMirroredBuffer : public IMirroredBuffer
+{
+public:
+    void allocate(size_t size)
+    {
+        mSize = size;
+        mHostBuffer.allocate(size);
+        mDeviceBuffer.allocate(size);
+    }
+
+    void* getDeviceBuffer() const
+    {
+        return mDeviceBuffer.get();
+    }
+
+    void* getHostBuffer() const
+    {
+        return mHostBuffer.get();
+    }
+
+    void hostToDevice(cudaStream_t& stream)
+    {
+        cudaCheck(cudaMemcpyAsync(mDeviceBuffer.get(), mHostBuffer.get(), mSize, cudaMemcpyHostToDevice, stream));
+    }
+
+    void deviceToHost(cudaStream_t& stream)
+    {
+        cudaCheck(cudaMemcpyAsync(mHostBuffer.get(), mDeviceBuffer.get(), mSize, cudaMemcpyDeviceToHost, stream));
+    }
+
+    size_t getSize() const
+    {
+        return mSize;
+    }
+
+private:
+    size_t mSize{0};
+    TrtHostBuffer mHostBuffer;
+    TrtDeviceBuffer mDeviceBuffer;
+}; // class DiscreteMirroredBuffer
+
+//!
+//! Class to allocate memory for outputs with data-dependent shapes. The sizes of those are unknown so pre-allocation is
+//! not possible.
+//!
+class OutputAllocator : public nvinfer1::IOutputAllocator
+{
+public:
+    OutputAllocator(IMirroredBuffer* buffer)
+        : mBuffer(buffer)
+    {
+    }
+
+    void* reallocateOutput(
+        char const* tensorName, void* currentMemory, uint64_t size, uint64_t alignment) noexcept override
+    {
+        // Some memory allocators return nullptr when allocating zero bytes, but TensorRT requires a non-null ptr
+        // even for empty tensors, so allocate a dummy byte.
+        size = std::max(size, static_cast<uint64_t>(1));
+        if (size > mSize)
+        {
+            mBuffer->allocate(roundUp(size, alignment));
+            mSize = size;
+        }
+        return mBuffer->getDeviceBuffer();
+    }
+
+    void notifyShape(char const* tensorName, nvinfer1::Dims const& dims) noexcept override {}
+
+    IMirroredBuffer* getBuffer()
+    {
+        return mBuffer.get();
+    }
+
+    virtual ~OutputAllocator() {}
+
+private:
+    std::unique_ptr<IMirroredBuffer> mBuffer;
+    uint64_t mSize{};
+};
+
 // [DLIS-4283] temporary workaround to separate TRT v1 and TRT v3 usage
 // in polymorphic style
 class TRTInterface {
@@ -469,7 +682,8 @@ class ModelInstanceState : public TensorRTModelInstance {
         : byte_size_(0), buffer_(nullptr), device_buffer_(nullptr),
           memory_type_(TRITONSERVER_MEMORY_GPU), memory_type_id_(0),
           buffer_is_ragged_(false), format_(),
-          is_state_output_(false), is_requested_output_tensor_(false)
+          is_state_output_(false), is_requested_output_tensor_(false),
+          output_allocator_(nullptr)
     {
     }
     std::string name_;
@@ -498,6 +712,10 @@ class ModelInstanceState : public TensorRTModelInstance {
 
     // Indicates whether the output is a output tensor.
     bool is_requested_output_tensor_;
+
+    // Output allocator
+    std::unique_ptr<OutputAllocator> output_allocator_;
+
   };
 
   // There will be two sets of input/output buffers when

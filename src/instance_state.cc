@@ -27,6 +27,7 @@
 #include "instance_state.h"
 #include "tensorrt_utils.h"
 #include "triton/common/nvtx.h"
+#include <algorithm>
 
 namespace triton { namespace backend { namespace tensorrt {
 
@@ -271,17 +272,19 @@ ModelInstanceState::~ModelInstanceState()
     for (auto& io_binding_info : io_binding_infos) {
       if (io_binding_info.buffer_ != nullptr) {
         cudaError_t err = cudaSuccess;
-        if (io_binding_info.memory_type_ == TRITONSERVER_MEMORY_GPU) {
-          err = cudaFree(io_binding_info.buffer_);
-        } else {
-          err = cudaFreeHost(io_binding_info.buffer_);
-        }
-        if (err != cudaSuccess) {
-          LOG_MESSAGE(
-              TRITONSERVER_LOG_ERROR,
-              (std::string("Failed to free allocated memory for '") + Name() +
-               "': " + cudaGetErrorString(err))
-                  .c_str());
+        if (io_binding_info.output_allocator_ == nullptr) {
+          if (io_binding_info.memory_type_ == TRITONSERVER_MEMORY_GPU) {
+            err = cudaFree(io_binding_info.buffer_);
+          } else {
+            err = cudaFreeHost(io_binding_info.buffer_);
+          }
+          if (err != cudaSuccess) {
+            LOG_MESSAGE(
+                TRITONSERVER_LOG_ERROR,
+                (std::string("Failed to free allocated memory for '") + Name() +
+                "': " + cudaGetErrorString(err))
+                    .c_str());
+          }
         }
       }
     }
@@ -939,7 +942,7 @@ ModelInstanceState::Run(
             io_binding_info.byte_size_));
       }
     }
-
+    std::cout << "Interface_ enqueue ...";
     if (!interface_->Enqueue(citr->second.context_.get())) {
       cudaStreamSynchronize(stream_);
       FAIL_ALL_AND_RETURN_IF_ERROR(
@@ -950,6 +953,7 @@ ModelInstanceState::Run(
                   .c_str()),
           "failed to run TRT inference");
     }
+    std::cout << "Finishenqueue  ...";
   }
 
   cudaEventRecord(events_[next_set_].ready_for_output_, stream_);
@@ -1117,7 +1121,11 @@ ModelInstanceState::Run(
       if (support_batching_) {
         batch1_byte_size /= payload_->total_batch_size_;
       }
-
+      if (io_binding_info.output_allocator_ != nullptr) {
+        io_binding_info.buffer_ = io_binding_info.output_allocator_->getBuffer()->getDeviceBuffer();
+        io_binding_info.device_buffer_ = io_binding_info.output_allocator_->getBuffer()->getDeviceBuffer();
+        io_binding_info.byte_size_ = io_binding_info.output_allocator_->getBuffer()->getSize();
+      }
       if (io_binding_info.byte_size_ <
           (batch1_byte_size * payload_->total_batch_size_)) {
         FAIL_ALL_AND_RETURN_IF_ERROR(
@@ -2775,6 +2783,8 @@ ModelInstanceState::InitializeExecuteOutputBinding(
   // the maximum byte sizes across all profiles
   int64_t max_byte_size = 0;
 
+  bool is_dynamic = true;
+
   int io_index = engine_->getBindingIndex(output_name.c_str());
 
   auto& io_binding_info = io_binding_infos_[next_buffer_binding_set_][io_index];
@@ -2844,6 +2854,8 @@ ModelInstanceState::InitializeExecuteOutputBinding(
           name_, output_name, engine_dims, output_dims, support_batching_,
           (!engine_->hasImplicitBatchDimension()), false /* compare_exact */));
     }
+
+    is_dynamic = std::any_of(engine_dims.d, engine_dims.d+engine_dims.nbDims, [](int32_t dim) { return dim == -1; });
 
     if (io_binding_info.buffer_is_ragged_ &&
         !io_binding_info.format_.is_linear_format_) {
@@ -2922,10 +2934,18 @@ ModelInstanceState::InitializeExecuteOutputBinding(
   // allocated
   for (auto& trt_context : trt_contexts_) {
     auto binding_index = num_expected_bindings_ * trt_context.first + io_index;
-    buffer_bindings_[next_buffer_binding_set_][binding_index] =
-        io_binding_info.device_buffer_;
-    RETURN_ERROR_IF_FALSE(trt_context.second.context_->setTensorAddress(output_name.c_str(), io_binding_info.device_buffer_),
-        TRITONSERVER_ERROR_INVALID_ARG, (std::string("'") + output_name + "' does not map to an input or output tensor"));
+
+    if (is_dynamic) {
+      io_binding_info.output_allocator_.reset(new OutputAllocator(new DiscreteMirroredBuffer));
+      if (!trt_context.second.context_->setOutputAllocator(output_name.c_str(), io_binding_info.output_allocator_.get())) {
+        LOG_MESSAGE(TRITONSERVER_LOG_ERROR, "Fail to set output allocator");
+      }
+    } else {
+      buffer_bindings_[next_buffer_binding_set_][binding_index] =
+          io_binding_info.device_buffer_;
+      RETURN_ERROR_IF_FALSE(trt_context.second.context_->setTensorAddress(output_name.c_str(), io_binding_info.device_buffer_),
+          TRITONSERVER_ERROR_INVALID_ARG, (std::string("'") + output_name + "' does not map to an input or output tensor"));
+    }
   }
 
   return nullptr;
@@ -3890,8 +3910,10 @@ TRTv3Interface::SetTensorAddress(nvinfer1::IExecutionContext* context)
 {
   const auto& io_binding_info = instance_->io_binding_infos_[instance_->next_buffer_binding_set_];
   for (const auto& info : io_binding_info) {
-    if (!context->setTensorAddress(info.name_.c_str(), info.device_buffer_)) {
-      return false;
+    if (info.output_allocator_ == nullptr) {
+      if (!context->setTensorAddress(info.name_.c_str(), info.device_buffer_)) {
+        return false;
+      }
     }
   }
   return true;
