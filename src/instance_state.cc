@@ -942,7 +942,6 @@ ModelInstanceState::Run(
             io_binding_info.byte_size_));
       }
     }
-    std::cout << "Interface_ enqueue ...";
     if (!interface_->Enqueue(citr->second.context_.get())) {
       cudaStreamSynchronize(stream_);
       FAIL_ALL_AND_RETURN_IF_ERROR(
@@ -953,7 +952,6 @@ ModelInstanceState::Run(
                   .c_str()),
           "failed to run TRT inference");
     }
-    std::cout << "Finishenqueue  ...";
   }
 
   cudaEventRecord(events_[next_set_].ready_for_output_, stream_);
